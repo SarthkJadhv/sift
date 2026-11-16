@@ -14,6 +14,7 @@ and provides context optimization recommendations.`,
 
 	rootCmd.AddCommand(newVersionCommand())
 	rootCmd.AddCommand(newInitCommand())
+	rootCmd.AddCommand(newListCommand())
 	return rootCmd.Execute()
 
 }
