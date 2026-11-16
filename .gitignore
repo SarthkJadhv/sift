@@ -1,3 +1,10 @@
+# SIFT local data
 .sift/
-.DS_Store
+
+# Build artifacts
+/bin/
+/sift
+
+# Environment and system files
 .env
+.DS_Store
