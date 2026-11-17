@@ -73,8 +73,8 @@ func TestMigrationIsRecorded(t *testing.T) {
 		t.Fatalf("AppliedMigrationCount() failed: %v", err)
 	}
 
-	if count != 1 {
-		t.Fatalf("expected 1 applied migration, got %d", count)
+	if count != 2 {
+		t.Fatalf("expected 2 applied migrations, got %d", count)
 	}
 }
 
@@ -105,8 +105,8 @@ func TestMigrateIsIdempotent(t *testing.T) {
 		t.Fatalf("AppliedMigrationCount() failed: %v", err)
 	}
 
-	if count != 1 {
-		t.Fatalf("expected 1 migration after rerun, got %d", count)
+	if count != 2 {
+		t.Fatalf("expected 2 migrations after rerun, got %d", count)
 	}
 
 	var secondAppliedAt string
