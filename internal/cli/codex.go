@@ -23,6 +23,7 @@ func newCodexCommand() *cobra.Command {
 
 	cmd.AddCommand(newCodexImportCommand())
 	cmd.AddCommand(newCodexStatsCommand())
+	cmd.AddCommand(newCodexHistoryCommand())
 
 	return cmd
 }
@@ -203,6 +204,127 @@ func newCodexStatsCommand() *cobra.Command {
 	}
 }
 
+func newCodexHistoryCommand() *cobra.Command {
+	var limit int
+
+	cmd := &cobra.Command{
+		Use:   "history",
+		Short: "Display recent Codex sessions for the current project",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			return runCodexHistory(cmd, limit)
+		},
+	}
+
+	cmd.Flags().IntVarP(
+		&limit,
+		"limit",
+		"n",
+		20,
+		"Maximum number of sessions to display",
+	)
+
+	return cmd
+}
+
+func runCodexHistory(cmd *cobra.Command, limit int) error {
+	ctx := cmd.Context()
+
+	cwd, err := os.Getwd()
+	if err != nil {
+		return fmt.Errorf("get working directory: %w", err)
+	}
+
+	root, err := project.FindRoot(cwd)
+	if err != nil {
+		return fmt.Errorf("find project root: %w", err)
+	}
+
+	cfg, err := config.Load(filepath.Join(root, ".sift", "config.json"))
+	if err != nil {
+		return fmt.Errorf("load SIFT configuration: %w; run sift init first", err)
+	}
+
+	paths, err := appdata.Resolve()
+	if err != nil {
+		return fmt.Errorf("resolve SIFT application data: %w", err)
+	}
+
+	db, err := storage.OpenSQLite(ctx, paths.Database)
+	if err != nil {
+		return fmt.Errorf("open SIFT database: %w", err)
+	}
+	defer db.Close()
+
+	projectRepo, err := repositories.NewProjectRepository(db.DB)
+	if err != nil {
+		return fmt.Errorf("create project repository: %w", err)
+	}
+
+	registeredProject, err := projectRepo.GetByID(ctx, cfg.ProjectID)
+	if err != nil {
+		return fmt.Errorf("find registered project: %w", err)
+	}
+
+	if registeredProject.RootPath != cfg.RootPath {
+		return fmt.Errorf("project configuration does not match registered project")
+	}
+
+	codexRepo := repositories.NewCodexRepository(db.DB)
+
+	sessions, err := codexRepo.ListSessions(
+		ctx,
+		registeredProject.ID,
+		limit,
+	)
+	if err != nil {
+		return fmt.Errorf("get Codex session history: %w", err)
+	}
+
+	out := cmd.OutOrStdout()
+
+	fmt.Fprintf(out, "\nCodex Session History — %s\n", registeredProject.Name)
+	fmt.Fprintln(out, "----------------------------------------")
+
+	if len(sessions) == 0 {
+		fmt.Fprintln(out, "No imported Codex sessions found.")
+		return nil
+	}
+
+	for i, session := range sessions {
+		fmt.Fprintf(
+			out,
+			"\n%d. %s\n",
+			i+1,
+			session.SessionID,
+		)
+
+		startedAt := "Unknown"
+		if !session.StartedAt.IsZero() {
+			startedAt = session.StartedAt.Format("2006-01-02 15:04:05")
+		}
+
+		fmt.Fprintf(out, "   Started:     %s\n", startedAt)
+		fmt.Fprintf(out, "   Models:      %s\n", displayOrUnknown(session.Models))
+		fmt.Fprintf(out, "   Turns:       %d (%d completed)\n",
+			session.Turns, session.CompletedTurns)
+		fmt.Fprintf(out, "   Responses:   %d\n", session.Responses)
+		fmt.Fprintf(out, "   Tokens:      %d\n", session.TotalTokens)
+		fmt.Fprintf(out, "   Tool calls:  %d\n", session.ToolCalls)
+		fmt.Fprintf(out, "   Turn time:   %s\n", session.TotalTurnDuration)
+	}
+
+	return nil
+}
+
+func displayOrUnknown(value string) string {
+	if strings.TrimSpace(value) == "" {
+		return "Unknown"
+	}
+
+	return value
+}
+
 func runCodexStats(cmd *cobra.Command, _ []string) error {
 	ctx := cmd.Context()
 
@@ -253,6 +375,16 @@ func runCodexStats(cmd *cobra.Command, _ []string) error {
 		return fmt.Errorf("get Codex statistics: %w", err)
 	}
 
+	modelUsage, err := codexRepo.GetModelUsage(ctx, registeredProject.ID)
+	if err != nil {
+		return fmt.Errorf("get model usage: %w", err)
+	}
+
+	effortUsage, err := codexRepo.GetEffortUsage(ctx, registeredProject.ID)
+	if err != nil {
+		return fmt.Errorf("get effort usage: %w", err)
+	}
+
 	out := cmd.OutOrStdout()
 
 	fmt.Fprintln(out)
@@ -279,6 +411,31 @@ func runCodexStats(cmd *cobra.Command, _ []string) error {
 	fmt.Fprintln(out, "\nPERFORMANCE")
 	fmt.Fprintf(out, "  Avg turn duration: %s\n", stats.AverageTurnDuration)
 
+	fmt.Fprintln(out, "\nMODEL BREAKDOWN")
+
+	if len(modelUsage) == 0 {
+		fmt.Fprintln(out, "  No model usage recorded")
+	}
+
+	for _, usage := range modelUsage {
+		fmt.Fprintf(out, "  Model: %s\n", usage.Model)
+		fmt.Fprintf(out, "    Responses:     %d\n", usage.Responses)
+		fmt.Fprintf(out, "    Input tokens:  %d\n", usage.InputTokens)
+		fmt.Fprintf(out, "    Output tokens: %d\n", usage.OutputTokens)
+		fmt.Fprintf(out, "    Total tokens:  %d\n", usage.TotalTokens)
+	}
+
+	fmt.Fprintln(out, "\nREASONING EFFORT BREAKDOWN")
+
+	if len(effortUsage) == 0 {
+		fmt.Fprintln(out, "  No effort data recorded")
+	}
+
+	for _, usage := range effortUsage {
+		fmt.Fprintf(out, "  Effort: %s\n", usage.Effort)
+		fmt.Fprintf(out, "    Responses:    %d\n", usage.Responses)
+		fmt.Fprintf(out, "    Total tokens: %d\n", usage.TotalTokens)
+	}
 	return nil
 }
 

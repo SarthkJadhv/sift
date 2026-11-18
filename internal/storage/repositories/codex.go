@@ -32,6 +32,241 @@ type CodexStats struct {
 	AverageTurnDuration   time.Duration
 }
 
+// CodexModelUsage contains token usage aggregated by model.
+type CodexModelUsage struct {
+	Model                 string
+	Responses             int64
+	InputTokens           int64
+	CachedInputTokens     int64
+	OutputTokens          int64
+	ReasoningOutputTokens int64
+	TotalTokens           int64
+}
+
+// GetEffortUsage returns token usage grouped by reasoning effort.
+func (r *CodexRepository) GetEffortUsage(
+	ctx context.Context,
+	projectID string,
+) ([]CodexEffortUsage, error) {
+	if r == nil || r.db == nil {
+		return nil, errors.New("codex repository database is nil")
+	}
+
+	if strings.TrimSpace(projectID) == "" {
+		return nil, errors.New("project ID cannot be empty")
+	}
+
+	const query = `
+		SELECT
+			COALESCE(NULLIF(t.effort, ''), 'unknown') AS effort,
+			COUNT(*) AS responses,
+			COALESCE(SUM(u.input_tokens), 0),
+			COALESCE(SUM(u.cached_input_tokens), 0),
+			COALESCE(SUM(u.output_tokens), 0),
+			COALESCE(SUM(u.reasoning_output_tokens), 0),
+			COALESCE(SUM(u.total_tokens), 0)
+		FROM codex_response_usage u
+		JOIN codex_sessions s
+			ON s.id = u.session_id
+		LEFT JOIN codex_turns t
+			ON t.session_id = u.session_id
+			AND t.turn_id = u.turn_id
+		WHERE s.project_id = ?
+		GROUP BY COALESCE(NULLIF(t.effort, ''), 'unknown')
+		ORDER BY effort ASC
+	`
+
+	rows, err := r.db.QueryContext(ctx, query, projectID)
+	if err != nil {
+		return nil, fmt.Errorf("query effort usage: %w", err)
+	}
+	defer rows.Close()
+
+	var results []CodexEffortUsage
+
+	for rows.Next() {
+		var usage CodexEffortUsage
+
+		if err := rows.Scan(
+			&usage.Effort,
+			&usage.Responses,
+			&usage.InputTokens,
+			&usage.CachedInputTokens,
+			&usage.OutputTokens,
+			&usage.ReasoningOutputTokens,
+			&usage.TotalTokens,
+		); err != nil {
+			return nil, fmt.Errorf("scan effort usage: %w", err)
+		}
+
+		results = append(results, usage)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate effort usage: %w", err)
+	}
+
+	return results, nil
+}
+
+// ListSessions returns the most recent Codex sessions for a project.
+func (r *CodexRepository) ListSessions(
+	ctx context.Context,
+	projectID string,
+	limit int,
+) ([]CodexSessionSummary, error) {
+	if r == nil || r.db == nil {
+		return nil, errors.New("codex repository database is nil")
+	}
+
+	if strings.TrimSpace(projectID) == "" {
+		return nil, errors.New("project ID cannot be empty")
+	}
+
+	if limit <= 0 {
+		limit = 20
+	}
+
+	if limit > 100 {
+		limit = 100
+	}
+
+	const query = `
+		SELECT
+			s.id,
+			s.started_at,
+			s.working_directory,
+			s.cli_version,
+
+			COALESCE((
+				SELECT GROUP_CONCAT(model, ', ')
+				FROM (
+					SELECT DISTINCT model
+					FROM codex_turns
+					WHERE session_id = s.id
+					  AND model <> ''
+					ORDER BY model
+				)
+			), ''),
+
+			(SELECT COUNT(*)
+			 FROM codex_turns
+			 WHERE session_id = s.id),
+
+			(SELECT COUNT(*)
+			 FROM codex_turns
+			 WHERE session_id = s.id
+			   AND completed_at <> ''),
+
+			(SELECT COUNT(*)
+			 FROM codex_response_usage
+			 WHERE session_id = s.id),
+
+			(SELECT COALESCE(SUM(input_tokens), 0)
+			 FROM codex_response_usage
+			 WHERE session_id = s.id),
+
+			(SELECT COALESCE(SUM(output_tokens), 0)
+			 FROM codex_response_usage
+			 WHERE session_id = s.id),
+
+			(SELECT COALESCE(SUM(total_tokens), 0)
+			 FROM codex_response_usage
+			 WHERE session_id = s.id),
+
+			(SELECT COUNT(*)
+			 FROM codex_tool_activities
+			 WHERE session_id = s.id),
+
+			(SELECT COALESCE(SUM(duration_ns), 0)
+			 FROM codex_turns
+			 WHERE session_id = s.id)
+
+		FROM codex_sessions s
+		WHERE s.project_id = ?
+		ORDER BY s.started_at DESC, s.id DESC
+		LIMIT ?
+	`
+
+	rows, err := r.db.QueryContext(ctx, query, projectID, limit)
+	if err != nil {
+		return nil, fmt.Errorf("query Codex session history: %w", err)
+	}
+	defer rows.Close()
+
+	results := make([]CodexSessionSummary, 0)
+
+	for rows.Next() {
+		var summary CodexSessionSummary
+		var startedAt string
+		var durationNS int64
+
+		err := rows.Scan(
+			&summary.SessionID,
+			&startedAt,
+			&summary.WorkingDirectory,
+			&summary.CLIVersion,
+			&summary.Models,
+			&summary.Turns,
+			&summary.CompletedTurns,
+			&summary.Responses,
+			&summary.InputTokens,
+			&summary.OutputTokens,
+			&summary.TotalTokens,
+			&summary.ToolCalls,
+			&durationNS,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("scan Codex session history: %w", err)
+		}
+
+		if startedAt != "" {
+			summary.StartedAt, err = time.Parse(time.RFC3339Nano, startedAt)
+			if err != nil {
+				return nil, fmt.Errorf("parse session start time: %w", err)
+			}
+		}
+
+		summary.TotalTurnDuration = time.Duration(durationNS)
+
+		results = append(results, summary)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate Codex session history: %w", err)
+	}
+
+	return results, nil
+}
+
+// CodexEffortUsage contains token usage grouped by reasoning effort.
+type CodexEffortUsage struct {
+	Effort                string
+	Responses             int64
+	InputTokens           int64
+	CachedInputTokens     int64
+	OutputTokens          int64
+	ReasoningOutputTokens int64
+	TotalTokens           int64
+}
+
+// CodexSessionSummary represents an aggregated Codex session.
+type CodexSessionSummary struct {
+	SessionID         string
+	StartedAt         time.Time
+	WorkingDirectory  string
+	CLIVersion        string
+	Models            string
+	Turns             int64
+	CompletedTurns    int64
+	Responses         int64
+	InputTokens       int64
+	OutputTokens      int64
+	TotalTokens       int64
+	ToolCalls         int64
+	TotalTurnDuration time.Duration
+}
+
 func NewCodexRepository(db *sql.DB) *CodexRepository {
 	return &CodexRepository{db: db}
 }
@@ -203,6 +438,73 @@ func (r *CodexRepository) GetStats(
 	stats.AverageTurnDuration = time.Duration(averageDurationNS)
 
 	return stats, nil
+}
+
+// GetModelUsage returns token usage grouped by model for a SIFT project.
+func (r *CodexRepository) GetModelUsage(
+	ctx context.Context,
+	projectID string,
+) ([]CodexModelUsage, error) {
+	if r == nil || r.db == nil {
+		return nil, errors.New("codex repository database is nil")
+	}
+
+	if strings.TrimSpace(projectID) == "" {
+		return nil, errors.New("project ID cannot be empty")
+	}
+
+	const query = `
+		SELECT
+			COALESCE(NULLIF(t.model, ''), 'unknown') AS model,
+			COUNT(*) AS responses,
+			COALESCE(SUM(u.input_tokens), 0),
+			COALESCE(SUM(u.cached_input_tokens), 0),
+			COALESCE(SUM(u.output_tokens), 0),
+			COALESCE(SUM(u.reasoning_output_tokens), 0),
+			COALESCE(SUM(u.total_tokens), 0)
+		FROM codex_response_usage u
+		JOIN codex_sessions s
+			ON s.id = u.session_id
+		LEFT JOIN codex_turns t
+			ON t.session_id = u.session_id
+			AND t.turn_id = u.turn_id
+		WHERE s.project_id = ?
+		GROUP BY COALESCE(NULLIF(t.model, ''), 'unknown')
+		ORDER BY model ASC
+	`
+
+	rows, err := r.db.QueryContext(ctx, query, projectID)
+	if err != nil {
+		return nil, fmt.Errorf("query model usage: %w", err)
+	}
+	defer rows.Close()
+
+	var results []CodexModelUsage
+
+	for rows.Next() {
+		var usage CodexModelUsage
+
+		err := rows.Scan(
+			&usage.Model,
+			&usage.Responses,
+			&usage.InputTokens,
+			&usage.CachedInputTokens,
+			&usage.OutputTokens,
+			&usage.ReasoningOutputTokens,
+			&usage.TotalTokens,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("scan model usage: %w", err)
+		}
+
+		results = append(results, usage)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate model usage: %w", err)
+	}
+
+	return results, nil
 }
 
 // Import persists a complete Codex rollout and its activity.

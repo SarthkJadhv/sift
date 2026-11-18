@@ -361,19 +361,176 @@ func TestCodexRepositoryImportRollsBackOnFailure(t *testing.T) {
 		}
 	}
 }
-func TestCodexRepositoryGetStats(t *testing.T) {
+func TestCodexRepositoryGetEffortUsage(t *testing.T) {
 	repo, ctx, projectID := newTestCodexRepository(t)
 
 	session := newTestCodexSession()
+
+	session.Turns = append(session.Turns, codex.Turn{
+		ID:     "turn-2",
+		Model:  "gpt-5.1",
+		Effort: "high",
+	})
+
+	session.Responses = append(session.Responses, codex.ResponseUsage{
+		ResponseID: "response-2",
+		SessionID:  session.ID,
+		ThreadID:   "thread-1",
+		TurnID:     "turn-2",
+		Timestamp:  session.StartedAt.Add(time.Minute),
+		Usage: codex.TokenUsage{
+			InputTokens:  2000,
+			OutputTokens: 300,
+			TotalTokens:  2300,
+		},
+	})
 
 	err := repo.Import(
 		ctx,
 		projectID,
 		filepath.Join(t.TempDir(), "rollout.jsonl"),
-		1024,
+		2048,
 		123456,
 		session,
 	)
+	if err != nil {
+		t.Fatalf("Import() failed: %v", err)
+	}
+
+	results, err := repo.GetEffortUsage(ctx, projectID)
+	if err != nil {
+		t.Fatalf("GetEffortUsage() failed: %v", err)
+	}
+
+	if len(results) != 2 {
+		t.Fatalf("expected 2 effort groups, got %d", len(results))
+	}
+
+	expected := map[string]struct {
+		responses int64
+		input     int64
+		total     int64
+	}{
+		"medium": {
+			responses: 1,
+			input:     1000,
+			total:     1200,
+		},
+		"high": {
+			responses: 1,
+			input:     2000,
+			total:     2300,
+		},
+	}
+
+	for _, result := range results {
+		want, exists := expected[result.Effort]
+		if !exists {
+			t.Errorf("unexpected effort: %s", result.Effort)
+			continue
+		}
+
+		if result.Responses != want.responses {
+			t.Errorf("%s: responses = %d, want %d",
+				result.Effort, result.Responses, want.responses)
+		}
+
+		if result.InputTokens != want.input {
+			t.Errorf("%s: input tokens = %d, want %d",
+				result.Effort, result.InputTokens, want.input)
+		}
+
+		if result.TotalTokens != want.total {
+			t.Errorf("%s: total tokens = %d, want %d",
+				result.Effort, result.TotalTokens, want.total)
+		}
+	}
+}
+
+func TestCodexRepositoryListSessions(t *testing.T) {
+	repo, ctx, projectID := newTestCodexRepository(t)
+
+	first := newTestCodexSession()
+
+	if err := repo.Import(
+		ctx,
+		projectID,
+		filepath.Join(t.TempDir(), "first.jsonl"),
+		1024,
+		123456,
+		first,
+	); err != nil {
+		t.Fatalf("first Import() failed: %v", err)
+	}
+
+	// Create a second session with a later start time.
+	second := *newTestCodexSession()
+	second.ID = "session-2"
+	second.StartedAt = first.StartedAt.Add(time.Hour)
+
+	second.Turns = append([]codex.Turn(nil), first.Turns...)
+	second.Turns[0].ID = "turn-2"
+	second.Turns[0].Model = "gpt-5.1"
+
+	second.Responses = append([]codex.ResponseUsage(nil), first.Responses...)
+	second.Responses[0].ResponseID = "response-2"
+	second.Responses[0].SessionID = second.ID
+	second.Responses[0].TurnID = "turn-2"
+
+	second.ToolActivities = nil
+
+	if err := repo.Import(
+		ctx,
+		projectID,
+		filepath.Join(t.TempDir(), "second.jsonl"),
+		2048,
+		123457,
+		&second,
+	); err != nil {
+		t.Fatalf("second Import() failed: %v", err)
+	}
+
+	results, err := repo.ListSessions(ctx, projectID, 10)
+	if err != nil {
+		t.Fatalf("ListSessions() failed: %v", err)
+	}
+
+	if len(results) != 2 {
+		t.Fatalf("expected 2 sessions, got %d", len(results))
+	}
+
+	// Newest session should be first.
+	if results[0].SessionID != "session-2" {
+		t.Errorf("first session = %s, want session-2",
+			results[0].SessionID)
+	}
+
+	if results[0].Models != "gpt-5.1" {
+		t.Errorf("models = %q, want gpt-5.1", results[0].Models)
+	}
+
+	if results[0].TotalTokens != 1200 {
+		t.Errorf("total tokens = %d, want 1200",
+			results[0].TotalTokens)
+	}
+
+	if results[0].Turns != 1 {
+		t.Errorf("turns = %d, want 1", results[0].Turns)
+	}
+
+	if results[0].TotalTurnDuration != 2*time.Second {
+		t.Errorf("turn duration = %v, want 2s",
+			results[0].TotalTurnDuration)
+	}
+}
+
+func TestCodexRepositoryGetStats(t *testing.T) {
+	repo, ctx, projectID := newTestCodexRepository(t)
+	session := newTestCodexSession()
+
+	err := repo.Import(ctx, projectID,
+		filepath.Join(t.TempDir(), "rollout.jsonl"),
+		1024, 123456, session)
 	if err != nil {
 		t.Fatalf("Import() failed: %v", err)
 	}
@@ -383,36 +540,79 @@ func TestCodexRepositoryGetStats(t *testing.T) {
 		t.Fatalf("GetStats() failed: %v", err)
 	}
 
-	tests := []struct {
-		name string
-		got  int64
-		want int64
-	}{
-		{"Sessions", stats.Sessions, 1},
-		{"Turns", stats.Turns, 1},
-		{"CompletedTurns", stats.CompletedTurns, 1},
-		{"Responses", stats.Responses, 1},
-		{"InputTokens", stats.InputTokens, 1000},
-		{"CachedInputTokens", stats.CachedInputTokens, 400},
-		{"OutputTokens", stats.OutputTokens, 200},
-		{"ReasoningOutputTokens", stats.ReasoningOutputTokens, 50},
-		{"TotalTokens", stats.TotalTokens, 1200},
-		{"ToolCalls", stats.ToolCalls, 1},
-		{"ToolsWithOutput", stats.ToolsWithOutput, 1},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if tt.got != tt.want {
-				t.Errorf("got %d, want %d", tt.got, tt.want)
-			}
-		})
+	if stats.Sessions != 1 ||
+		stats.Turns != 1 ||
+		stats.CompletedTurns != 1 ||
+		stats.Responses != 1 ||
+		stats.InputTokens != 1000 ||
+		stats.CachedInputTokens != 400 ||
+		stats.OutputTokens != 200 ||
+		stats.ReasoningOutputTokens != 50 ||
+		stats.TotalTokens != 1200 ||
+		stats.ToolCalls != 1 ||
+		stats.ToolsWithOutput != 1 {
+		t.Fatalf("unexpected Codex stats: %+v", stats)
 	}
 
 	if stats.AverageTurnDuration != 2*time.Second {
-		t.Errorf(
-			"AverageTurnDuration = %v, want 2s",
-			stats.AverageTurnDuration,
-		)
+		t.Errorf("AverageTurnDuration = %v, want 2s",
+			stats.AverageTurnDuration)
+	}
+}
+func TestCodexRepositoryGetModelUsage(t *testing.T) {
+	repo, ctx, projectID := newTestCodexRepository(t)
+	session := newTestCodexSession()
+
+	session.Turns = append(session.Turns, codex.Turn{
+		ID:     "turn-2",
+		Model:  "gpt-5.1",
+		Effort: "high",
+	})
+
+	session.Responses = append(session.Responses, codex.ResponseUsage{
+		ResponseID: "response-2",
+		SessionID:  session.ID,
+		ThreadID:   "thread-1",
+		TurnID:     "turn-2",
+		Timestamp:  session.StartedAt.Add(time.Minute),
+		Usage: codex.TokenUsage{
+			InputTokens:  2000,
+			OutputTokens: 300,
+			TotalTokens:  2300,
+		},
+	})
+
+	err := repo.Import(ctx, projectID,
+		filepath.Join(t.TempDir(), "rollout.jsonl"),
+		2048, 123456, session)
+	if err != nil {
+		t.Fatalf("Import() failed: %v", err)
+	}
+
+	results, err := repo.GetModelUsage(ctx, projectID)
+	if err != nil {
+		t.Fatalf("GetModelUsage() failed: %v", err)
+	}
+
+	expected := map[string]int64{
+		"gpt-5":   1200,
+		"gpt-5.1": 2300,
+	}
+
+	if len(results) != len(expected) {
+		t.Fatalf("expected 2 model groups, got %d", len(results))
+	}
+
+	for _, result := range results {
+		want, exists := expected[result.Model]
+		if !exists {
+			t.Errorf("unexpected model: %s", result.Model)
+			continue
+		}
+
+		if result.TotalTokens != want {
+			t.Errorf("%s: total tokens = %d, want %d",
+				result.Model, result.TotalTokens, want)
+		}
 	}
 }
