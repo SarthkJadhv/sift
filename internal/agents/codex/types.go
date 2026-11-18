@@ -12,9 +12,10 @@ type Session struct {
 	Originator       string
 	ThreadSource     string
 
-	Turns          []Turn
-	Responses      []ResponseUsage
-	ToolActivities []ToolActivity
+	Turns            []Turn
+	Responses        []ResponseUsage
+	ToolActivities   []ToolActivity
+	ContextSnapshots []ContextSnapshot
 }
 
 // Turn contains the model configuration observed for a Codex turn.
@@ -71,4 +72,13 @@ type ToolActivity struct {
 
 	CallOrdinal   int64
 	OutputOrdinal int64
+}
+
+// ContextSnapshot represents a point-in-time context window measurement.
+type ContextSnapshot struct {
+	ObservedAt              time.Time
+	Sequence                int64
+	ActiveContextTokens     int64
+	ContextWindowTokens     int64
+	CumulativeSessionTokens int64
 }

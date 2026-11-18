@@ -14,6 +14,7 @@ type rolloutRecord struct {
 	Ordinal   int64           `json:"ordinal"`
 	Type      string          `json:"type"`
 	Payload   json.RawMessage `json:"payload"`
+	Sequence  int64           `json:"-"`
 }
 
 type sessionMetaPayload struct {
@@ -54,6 +55,15 @@ type taskEventPayload struct {
 	ModelContextWindow int64  `json:"model_context_window"`
 }
 
+type tokenCountEventPayload struct {
+	Type string `json:"type"`
+	Info struct {
+		TotalTokenUsage    TokenUsage `json:"total_token_usage"`
+		LastTokenUsage     TokenUsage `json:"last_token_usage"`
+		ModelContextWindow int64      `json:"model_context_window"`
+	} `json:"info"`
+}
+
 type toolCallPayload struct {
 	ID     string `json:"id"`
 	CallID string `json:"call_id"`
@@ -74,9 +84,10 @@ func ParseRollout(reader io.Reader) (*Session, error) {
 	decoder := json.NewDecoder(reader)
 
 	session := &Session{
-		Turns:          make([]Turn, 0),
-		Responses:      make([]ResponseUsage, 0),
-		ToolActivities: make([]ToolActivity, 0),
+		Turns:            make([]Turn, 0),
+		Responses:        make([]ResponseUsage, 0),
+		ToolActivities:   make([]ToolActivity, 0),
+		ContextSnapshots: make([]ContextSnapshot, 0),
 	}
 
 	turnIndexes := make(map[string]int)
@@ -100,6 +111,7 @@ func ParseRollout(reader io.Reader) (*Session, error) {
 		}
 
 		recordNumber++
+		record.Sequence = int64(recordNumber)
 
 		switch record.Type {
 		case "session_meta":
@@ -295,69 +307,104 @@ func parseEventMessage(
 	session *Session,
 	turnIndexes map[string]int,
 ) error {
-	var payload taskEventPayload
+	var event struct {
+		Type string `json:"type"`
+	}
 
-	if err := json.Unmarshal(record.Payload, &payload); err != nil {
+	if err := json.Unmarshal(record.Payload, &event); err != nil {
 		return err
 	}
 
-	if payload.Type != "task_started" &&
-		payload.Type != "task_complete" {
+	switch event.Type {
+	case "token_count":
+		var payload tokenCountEventPayload
+
+		if err := json.Unmarshal(record.Payload, &payload); err != nil {
+			return err
+		}
+
+		timestamp, err := parseTimestamp(record.Timestamp)
+		if err != nil {
+			return fmt.Errorf("invalid context snapshot timestamp: %w", err)
+		}
+
+		snapshot := ContextSnapshot{
+			ObservedAt:              timestamp,
+			Sequence:                record.Sequence,
+			ActiveContextTokens:     payload.Info.LastTokenUsage.TotalTokens,
+			ContextWindowTokens:     payload.Info.ModelContextWindow,
+			CumulativeSessionTokens: payload.Info.TotalTokenUsage.TotalTokens,
+		}
+
+		session.ContextSnapshots = append(
+			session.ContextSnapshots,
+			snapshot,
+		)
+
+		return nil
+
+	case "task_started", "task_complete":
+		var payload taskEventPayload
+
+		if err := json.Unmarshal(record.Payload, &payload); err != nil {
+			return err
+		}
+
+		if payload.TurnID == "" {
+			return nil
+		}
+
+		index := getOrCreateTurn(session, turnIndexes, payload.TurnID)
+		turn := &session.Turns[index]
+
+		if payload.ModelContextWindow > 0 {
+			turn.ModelContextWindow = payload.ModelContextWindow
+		}
+
+		switch payload.Type {
+		case "task_started":
+			if payload.StartedAt > 0 {
+				turn.StartedAt = time.UnixMilli(payload.StartedAt)
+			} else if turn.StartedAt.IsZero() {
+				timestamp, err := parseTimestamp(record.Timestamp)
+				if err != nil {
+					return err
+				}
+				turn.StartedAt = timestamp
+			}
+
+		case "task_complete":
+			if turn.StartedAt.IsZero() && payload.StartedAt > 0 {
+				turn.StartedAt = time.UnixMilli(payload.StartedAt)
+			}
+
+			if payload.CompletedAt > 0 {
+				turn.CompletedAt = time.UnixMilli(payload.CompletedAt)
+			} else {
+				timestamp, err := parseTimestamp(record.Timestamp)
+				if err != nil {
+					return err
+				}
+				turn.CompletedAt = timestamp
+			}
+
+			if payload.DurationMS > 0 {
+				turn.Duration = time.Duration(payload.DurationMS) * time.Millisecond
+			} else if !turn.StartedAt.IsZero() && !turn.CompletedAt.IsZero() {
+				turn.Duration = turn.CompletedAt.Sub(turn.StartedAt)
+			}
+
+			if payload.TimeToFirstTokenMS > 0 {
+				turn.TimeToFirstToken =
+					time.Duration(payload.TimeToFirstTokenMS) * time.Millisecond
+			}
+		}
+
+		return nil
+
+	default:
 		return nil
 	}
-
-	if payload.TurnID == "" {
-		return nil
-	}
-
-	index := getOrCreateTurn(session, turnIndexes, payload.TurnID)
-	turn := &session.Turns[index]
-
-	if payload.ModelContextWindow > 0 {
-		turn.ModelContextWindow = payload.ModelContextWindow
-	}
-
-	switch payload.Type {
-	case "task_started":
-		if payload.StartedAt > 0 {
-			turn.StartedAt = time.UnixMilli(payload.StartedAt)
-		} else if turn.StartedAt.IsZero() {
-			timestamp, err := parseTimestamp(record.Timestamp)
-			if err != nil {
-				return err
-			}
-			turn.StartedAt = timestamp
-		}
-
-	case "task_complete":
-		// task_complete also carries started_at in some Codex records.
-		if turn.StartedAt.IsZero() && payload.StartedAt > 0 {
-			turn.StartedAt = time.UnixMilli(payload.StartedAt)
-		}
-
-		if payload.CompletedAt > 0 {
-			turn.CompletedAt = time.UnixMilli(payload.CompletedAt)
-		} else {
-			timestamp, err := parseTimestamp(record.Timestamp)
-			if err != nil {
-				return err
-			}
-			turn.CompletedAt = timestamp
-		}
-
-		if payload.DurationMS > 0 {
-			turn.Duration = time.Duration(payload.DurationMS) * time.Millisecond
-		} else if !turn.StartedAt.IsZero() && !turn.CompletedAt.IsZero() {
-			turn.Duration = turn.CompletedAt.Sub(turn.StartedAt)
-		}
-
-		if payload.TimeToFirstTokenMS > 0 {
-			turn.TimeToFirstToken =
-				time.Duration(payload.TimeToFirstTokenMS) * time.Millisecond
-		}
-	}
-
-	return nil
 }
 
 func parseResponseItem(

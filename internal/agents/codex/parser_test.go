@@ -207,6 +207,27 @@ func TestParseRealRollout(t *testing.T) {
 	}
 
 	lastResponse := session.Responses[len(session.Responses)-1]
+	if len(session.ContextSnapshots) == 0 {
+		t.Fatal("no context snapshots were parsed")
+	}
+
+	latest := session.ContextSnapshots[len(session.ContextSnapshots)-1]
+
+	if latest.ActiveContextTokens <= 0 {
+		t.Error("latest active context token count is missing")
+	}
+
+	if latest.ContextWindowTokens <= 0 {
+		t.Error("model context window is missing")
+	}
+
+	utilization := float64(latest.ActiveContextTokens) /
+		float64(latest.ContextWindowTokens) * 100
+
+	t.Logf("Context snapshots: %d", len(session.ContextSnapshots))
+	t.Logf("Active context: %d tokens", latest.ActiveContextTokens)
+	t.Logf("Context window: %d tokens", latest.ContextWindowTokens)
+	t.Logf("Raw context utilization: %.2f%%", utilization)
 
 	var completedTurns int
 	for _, turn := range session.Turns {
@@ -234,4 +255,63 @@ func TestParseRealRollout(t *testing.T) {
 	t.Logf("Tool activities: %d", len(session.ToolActivities))
 	t.Logf("Tools with output: %d", toolsWithOutput)
 	t.Logf("Tools with duration: %d", toolsWithDuration)
+}
+
+func TestParseRolloutContextSnapshots(t *testing.T) {
+	input := `{"timestamp":"2026-11-17T10:00:00Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":10000,"cached_input_tokens":2000,"output_tokens":500,"reasoning_output_tokens":100,"total_tokens":10500},"last_token_usage":{"input_tokens":8000,"cached_input_tokens":2000,"output_tokens":200,"reasoning_output_tokens":50,"total_tokens":8200},"model_context_window":258400}}}
+{"type":"unknown_record","payload":{}}
+{"timestamp":"2026-11-17T10:01:00Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":20000,"cached_input_tokens":5000,"output_tokens":1000,"reasoning_output_tokens":200,"total_tokens":21000},"last_token_usage":{"input_tokens":15000,"cached_input_tokens":4000,"output_tokens":300,"reasoning_output_tokens":100,"total_tokens":15300},"model_context_window":258400}}}`
+
+	session, err := ParseRollout(strings.NewReader(input))
+	if err != nil {
+		t.Fatalf("ParseRollout() error = %v", err)
+	}
+
+	if len(session.ContextSnapshots) != 2 {
+		t.Fatalf(
+			"ContextSnapshots = %d, want 2",
+			len(session.ContextSnapshots),
+		)
+	}
+
+	first := session.ContextSnapshots[0]
+
+	if first.ActiveContextTokens != 8200 {
+		t.Errorf("ActiveContextTokens = %d, want 8200",
+			first.ActiveContextTokens)
+	}
+
+	if first.ContextWindowTokens != 258400 {
+		t.Errorf("ContextWindowTokens = %d, want 258400",
+			first.ContextWindowTokens)
+	}
+
+	if first.CumulativeSessionTokens != 10500 {
+		t.Errorf("CumulativeSessionTokens = %d, want 10500",
+			first.CumulativeSessionTokens)
+	}
+
+	if first.Sequence != 1 {
+		t.Errorf("first Sequence = %d, want 1", first.Sequence)
+	}
+
+	second := session.ContextSnapshots[1]
+
+	if second.ActiveContextTokens != 15300 {
+		t.Errorf("second ActiveContextTokens = %d, want 15300",
+			second.ActiveContextTokens)
+	}
+
+	if second.CumulativeSessionTokens != 21000 {
+		t.Errorf("second CumulativeSessionTokens = %d, want 21000",
+			second.CumulativeSessionTokens)
+	}
+
+	if second.Sequence != 3 {
+		t.Errorf("second Sequence = %d, want 3", second.Sequence)
+	}
+
+	if !second.ObservedAt.After(first.ObservedAt) {
+		t.Error("expected second snapshot to be later than first")
+	}
 }
